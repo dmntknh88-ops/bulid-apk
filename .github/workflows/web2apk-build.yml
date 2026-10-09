@@ -1,0 +1,184 @@
+name: Web2APK Auto Build Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Job ID'
+        required: true
+        type: string
+      userId:
+        description: 'User ID'
+        required: true
+        type: string
+      payload:
+        description: 'JSON payload (zipAssetUrl wajib dari bot)'
+        required: true
+        type: string
+
+env:
+  JAVA_VERSION: '17'
+  FLUTTER_VERSION: '3.24.5'
+  ANDROID_API: '34'
+  BUILD_TOOLS: '34.0.0'
+  CMDLINE_TOOLS: '11076708'
+
+jobs:
+  build:
+    name: Flutter Release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse payload
+        id: meta
+        run: |
+          set -e
+          echo '${{ inputs.payload }}' > /tmp/payload.json
+          python3 - <<'PY' >> $GITHUB_OUTPUT
+          import json
+          p = json.load(open('/tmp/payload.json'))
+          def g(*keys):
+              for k in keys:
+                  v = p.get(k)
+                  if v: return str(v)
+              return ''
+          print('zip_url=' + g('zipAssetUrl', 'zip_url', 'assetUrl'))
+          print('app_name=' + g('appName', 'app_name') or 'MyApp')
+          print('package_name=' + g('packageName', 'package_name') or 'com.example.app')
+          print('release_tag=' + g('zipReleaseTag', 'release_tag'))
+          PY
+          echo "job_id=${{ inputs.jobId }}" >> $GITHUB_OUTPUT
+          echo "Payload OK job=${{ inputs.jobId }}"
+
+      - name: Setup Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          set -e
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-${{ env.ANDROID_API }}" \
+            "build-tools;${{ env.BUILD_TOOLS }}" \
+            "ndk;26.1.10909125" || true
+          yes | sdkmanager --licenses || true
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          sdkmanager --list_installed | head -40
+
+      - name: Setup Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter doctor
+        run: |
+          flutter config --no-analytics
+          flutter doctor -v
+
+      # ── ZIP diunduh DARI GITHUB RELEASE (bukan dari VPS/Local API) ──
+      - name: Download project ZIP from GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZIP_URL: ${{ steps.meta.outputs.zip_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p project_src
+          if [ -z "${ZIP_URL}" ]; then
+            echo "::error::zipAssetUrl kosong di payload. Bot harus upload ZIP ke Release dulu."
+            cat /tmp/payload.json || true
+            exit 1
+          fi
+          echo "Downloading ZIP from GitHub asset API..."
+          echo "URL: $ZIP_URL"
+          # GITHUB_TOKEN repo ini cukup untuk unduh release asset repo yang sama
+          HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            "${ZIP_URL}")
+          echo "HTTP $HTTP"
+          SIZE=$(stat -c%s project.zip 2>/dev/null || echo 0)
+          echo "Downloaded ${SIZE} bytes"
+          if [ "$HTTP" != "200" ] && [ "$HTTP" != "302" ]; then
+            echo "::error::Gagal unduh ZIP HTTP $HTTP"
+            head -c 500 project.zip || true
+            exit 1
+          fi
+          if [ "$SIZE" -lt 1000 ]; then
+            echo "::error::ZIP terlalu kecil / bukan binary"
+            head -c 500 project.zip || true
+            exit 1
+          fi
+          unzip -q project.zip -d project_src
+          # flatten single root folder
+          if [ "$(find project_src -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ] && \
+             [ "$(find project_src -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0 ]; then
+            ROOT=$(find project_src -mindepth 1 -maxdepth 1 -type d | head -1)
+            mv "$ROOT"/* project_src/ 2>/dev/null || true
+            mv "$ROOT"/.[!.]* project_src/ 2>/dev/null || true
+            rmdir "$ROOT" 2>/dev/null || true
+          fi
+          echo "Project tree:"
+          find project_src -maxdepth 3 -type f | head -50
+
+      - name: Locate Flutter project
+        id: proj
+        run: |
+          set -e
+          if [ -f project_src/pubspec.yaml ]; then
+            echo "dir=project_src" >> $GITHUB_OUTPUT
+          else
+            FOUND=$(find project_src -name pubspec.yaml -type f | head -1)
+            if [ -z "$FOUND" ]; then
+              echo "::error::pubspec.yaml tidak ada di ZIP"
+              find project_src -maxdepth 4 -type f | head -80
+              exit 1
+            fi
+            echo "dir=$(dirname "$FOUND")" >> $GITHUB_OUTPUT
+          fi
+          echo "Using dir=$(grep dir= $GITHUB_OUTPUT | tail -1)"
+
+      - name: flutter pub get
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          flutter pub get
+          flutter precache --android || true
+
+      - name: Build APK release
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -e
+          flutter build apk --release
+          APK=$(find build/app/outputs/flutter-apk -name '*.apk' -type f | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find build -name '*.apk' -type f | head -1)
+          fi
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan setelah build"
+            find build -type f | head -50
+            exit 1
+          fi
+          cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
+          ls -lh "$GITHUB_WORKSPACE/app-release.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: app-release.apk
+          if-no-files-found: error
+          retention-days: 3
