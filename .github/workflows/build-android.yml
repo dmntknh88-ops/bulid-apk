@@ -15,8 +15,8 @@ on:
 
 env:
   JAVA_VERSION: '17'
-  ANDROID_API: '34'
-  BUILD_TOOLS: '34.0.0'
+  ANDROID_API_LEVEL: '34'
+  ANDROID_BUILD_TOOLS: '34.0.0'
 
 jobs:
   build:
@@ -43,12 +43,25 @@ jobs:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
 
-      - uses: android-actions/setup-android@v3
-
-      - name: SDK packages
+      - name: Install Android SDK
         run: |
-          sdkmanager --install "platform-tools" "platforms;android-${{ env.ANDROID_API }}" "build-tools;${{ env.BUILD_TOOLS }}"
-          yes | sdkmanager --licenses || true
+          set -euo pipefail
+          ANDROID_ROOT="$HOME/android-sdk"
+          mkdir -p "$ANDROID_ROOT/cmdline-tools"
+          cd /tmp
+          curl -fsSL -o cmdtools.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q cmdtools.zip -d "$ANDROID_ROOT/cmdline-tools"
+          rm -rf "$ANDROID_ROOT/cmdline-tools/latest"
+          mv "$ANDROID_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_ROOT/cmdline-tools/latest"
+          echo "ANDROID_HOME=$ANDROID_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_ROOT/platform-tools" >> "$GITHUB_PATH"
+          export ANDROID_HOME="$ANDROID_ROOT"
+          export PATH="$ANDROID_ROOT/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platform-tools" "platforms;android-${{ env.ANDROID_API_LEVEL }}" "build-tools;${{ env.ANDROID_BUILD_TOOLS }}"
 
       - name: Download ZIP from GitHub Release
         env:
