@@ -12,20 +12,19 @@ on:
         required: true
         type: string
       payload:
-        description: 'JSON payload (zipAssetUrl wajib dari bot)'
+        description: 'JSON payload'
         required: true
         type: string
 
 env:
   JAVA_VERSION: '17'
   FLUTTER_VERSION: '3.24.5'
-  ANDROID_API: '34'
-  BUILD_TOOLS: '34.0.0'
-  CMDLINE_TOOLS: '11076708'
+  ANDROID_API_LEVEL: '34'
+  ANDROID_BUILD_TOOLS: '34.0.0'
 
 jobs:
   build:
-    name: Flutter Release APK
+    name: Flutter APK
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -44,53 +43,63 @@ jobs:
           python3 - <<'PY' >> $GITHUB_OUTPUT
           import json
           p = json.load(open('/tmp/payload.json'))
-          def g(*keys):
-              for k in keys:
-                  v = p.get(k)
-                  if v: return str(v)
-              return ''
+          def g(*ks):
+            for k in ks:
+              v = p.get(k)
+              if v: return str(v)
+            return ''
           print('zip_url=' + g('zipAssetUrl', 'zip_url', 'assetUrl'))
-          print('app_name=' + g('appName', 'app_name') or 'MyApp')
-          print('package_name=' + g('packageName', 'package_name') or 'com.example.app')
-          print('release_tag=' + g('zipReleaseTag', 'release_tag'))
+          print('app_name=' + (g('appName', 'app_name') or 'MyApp'))
           PY
           echo "job_id=${{ inputs.jobId }}" >> $GITHUB_OUTPUT
-          echo "Payload OK job=${{ inputs.jobId }}"
 
-      - name: Setup Java ${{ env.JAVA_VERSION }}
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK components
+      # Android SDK manual — lebih stabil daripada setup-android action yang sering gagal
+      - name: Install Android SDK
         run: |
-          set -e
+          set -euo pipefail
+          ANDROID_ROOT="${ANDROID_HOME:-$HOME/android-sdk}"
+          mkdir -p "$ANDROID_ROOT/cmdline-tools"
+          cd /tmp
+          curl -fsSL -o cmdtools.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q cmdtools.zip -d "$ANDROID_ROOT/cmdline-tools"
+          # struktur yang diharapkan sdkmanager: cmdline-tools/latest
+          rm -rf "$ANDROID_ROOT/cmdline-tools/latest"
+          mv "$ANDROID_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_ROOT/cmdline-tools/latest"
+
+          echo "ANDROID_HOME=$ANDROID_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+          export ANDROID_HOME="$ANDROID_ROOT"
+          export PATH="$ANDROID_ROOT/cmdline-tools/latest/bin:$PATH"
+
+          yes | sdkmanager --licenses >/dev/null || true
           sdkmanager --install \
             "platform-tools" \
-            "platforms;android-${{ env.ANDROID_API }}" \
-            "build-tools;${{ env.BUILD_TOOLS }}" \
-            "ndk;26.1.10909125" || true
-          yes | sdkmanager --licenses || true
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          sdkmanager --list_installed | head -40
+            "platforms;android-${{ env.ANDROID_API_LEVEL }}" \
+            "build-tools;${{ env.ANDROID_BUILD_TOOLS }}"
+          sdkmanager --list_installed | head -30
 
-      - name: Setup Flutter ${{ env.FLUTTER_VERSION }}
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: 'stable'
+          channel: stable
           cache: true
 
       - name: Flutter doctor
         run: |
           flutter config --no-analytics
-          flutter doctor -v
+          flutter doctor -v || true
 
-      # ── ZIP diunduh DARI GITHUB RELEASE (bukan dari VPS/Local API) ──
       - name: Download project ZIP from GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -99,32 +108,22 @@ jobs:
           set -euo pipefail
           mkdir -p project_src
           if [ -z "${ZIP_URL}" ]; then
-            echo "::error::zipAssetUrl kosong di payload. Bot harus upload ZIP ke Release dulu."
+            echo "zipAssetUrl kosong"
             cat /tmp/payload.json || true
             exit 1
           fi
-          echo "Downloading ZIP from GitHub asset API..."
-          echo "URL: $ZIP_URL"
-          # GITHUB_TOKEN repo ini cukup untuk unduh release asset repo yang sama
+          echo "Download ZIP: $ZIP_URL"
           HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/octet-stream" \
             "${ZIP_URL}")
-          echo "HTTP $HTTP"
-          SIZE=$(stat -c%s project.zip 2>/dev/null || echo 0)
-          echo "Downloaded ${SIZE} bytes"
-          if [ "$HTTP" != "200" ] && [ "$HTTP" != "302" ]; then
-            echo "::error::Gagal unduh ZIP HTTP $HTTP"
-            head -c 500 project.zip || true
-            exit 1
-          fi
+          SIZE=$(stat -c%s project.zip)
+          echo "HTTP=$HTTP size=$SIZE"
           if [ "$SIZE" -lt 1000 ]; then
-            echo "::error::ZIP terlalu kecil / bukan binary"
-            head -c 500 project.zip || true
+            head -c 400 project.zip || true
             exit 1
           fi
           unzip -q project.zip -d project_src
-          # flatten single root folder
           if [ "$(find project_src -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ] && \
              [ "$(find project_src -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0 ]; then
             ROOT=$(find project_src -mindepth 1 -maxdepth 1 -type d | head -1)
@@ -132,31 +131,27 @@ jobs:
             mv "$ROOT"/.[!.]* project_src/ 2>/dev/null || true
             rmdir "$ROOT" 2>/dev/null || true
           fi
-          echo "Project tree:"
-          find project_src -maxdepth 3 -type f | head -50
+          find project_src -maxdepth 3 -type f | head -40
 
       - name: Locate Flutter project
         id: proj
         run: |
           set -e
           if [ -f project_src/pubspec.yaml ]; then
-            echo "dir=project_src" >> $GITHUB_OUTPUT
+            echo "dir=project_src" >> "$GITHUB_OUTPUT"
           else
             FOUND=$(find project_src -name pubspec.yaml -type f | head -1)
             if [ -z "$FOUND" ]; then
-              echo "::error::pubspec.yaml tidak ada di ZIP"
-              find project_src -maxdepth 4 -type f | head -80
+              echo "pubspec.yaml tidak ada"
+              find project_src -maxdepth 4 -type f | head -60
               exit 1
             fi
-            echo "dir=$(dirname "$FOUND")" >> $GITHUB_OUTPUT
+            echo "dir=$(dirname "$FOUND")" >> "$GITHUB_OUTPUT"
           fi
-          echo "Using dir=$(grep dir= $GITHUB_OUTPUT | tail -1)"
 
-      - name: flutter pub get
+      - name: Pub get
         working-directory: ${{ steps.proj.outputs.dir }}
-        run: |
-          flutter pub get
-          flutter precache --android || true
+        run: flutter pub get
 
       - name: Build APK release
         working-directory: ${{ steps.proj.outputs.dir }}
@@ -168,8 +163,8 @@ jobs:
             APK=$(find build -name '*.apk' -type f | head -1)
           fi
           if [ -z "$APK" ]; then
-            echo "::error::APK tidak ditemukan setelah build"
-            find build -type f | head -50
+            echo "APK tidak ditemukan"
+            find build -type f | head -40
             exit 1
           fi
           cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
