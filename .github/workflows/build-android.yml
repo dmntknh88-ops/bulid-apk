@@ -1,0 +1,93 @@
+name: Build Android Native APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        required: true
+        type: string
+      userId:
+        required: true
+        type: string
+      payload:
+        required: true
+        type: string
+
+env:
+  JAVA_VERSION: '17'
+  ANDROID_API: '34'
+  BUILD_TOOLS: '34.0.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse payload
+        id: meta
+        run: |
+          echo '${{ inputs.payload }}' > /tmp/payload.json
+          python3 - <<'PY' >> $GITHUB_OUTPUT
+          import json
+          p = json.load(open('/tmp/payload.json'))
+          print('zip_url=' + (p.get('zipAssetUrl') or p.get('zip_url') or ''))
+          PY
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: android-actions/setup-android@v3
+
+      - name: SDK packages
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-${{ env.ANDROID_API }}" "build-tools;${{ env.BUILD_TOOLS }}"
+          yes | sdkmanager --licenses || true
+
+      - name: Download ZIP from GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZIP_URL: ${{ steps.meta.outputs.zip_url }}
+        run: |
+          set -e
+          mkdir -p project_src
+          curl -fL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o project.zip "$ZIP_URL"
+          unzip -q project.zip -d project_src
+          if [ $(find project_src -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1 ] && [ $(find project_src -mindepth 1 -maxdepth 1 -type f | wc -l) -eq 0 ]; then
+            ROOT=$(find project_src -mindepth 1 -maxdepth 1 -type d | head -1)
+            mv "$ROOT"/* project_src/ 2>/dev/null || true
+            rmdir "$ROOT" 2>/dev/null || true
+          fi
+
+      - name: Locate Gradle
+        id: proj
+        run: |
+          if [ -f project_src/settings.gradle ] || [ -f project_src/settings.gradle.kts ]; then
+            echo "dir=project_src" >> $GITHUB_OUTPUT
+          else
+            F=$(find project_src -name 'settings.gradle*' | head -1)
+            [ -n "$F" ] || { echo "settings.gradle missing"; exit 1; }
+            echo "dir=$(dirname "$F")" >> $GITHUB_OUTPUT
+          fi
+
+      - name: assembleRelease
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          chmod +x gradlew || true
+          ./gradlew assembleRelease --no-daemon
+          APK=$(find . -path '*/outputs/apk/**/*.apk' | head -1)
+          [ -n "$APK" ] || APK=$(find . -name '*.apk' | head -1)
+          cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: app-release.apk
+          if-no-files-found: error
+          retention-days: 3
