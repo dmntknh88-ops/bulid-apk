@@ -20,6 +20,10 @@ on:
         required: false
         type: string
         default: ''
+      downloadToken:
+        required: false
+        type: string
+        default: ''
 
 env:
   JAVA_VERSION: '17'
@@ -35,39 +39,138 @@ jobs:
     permissions:
       contents: read
       actions: write
-      checks: read
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Parse payload
+      - name: Resolve download params
         id: meta
+        env:
+          PAYLOAD_JSON: ${{ inputs.payload }}
         run: |
           set -e
-          echo '${{ inputs.payload }}' > /tmp/payload.json
-          python3 - <<'PY' >> $GITHUB_OUTPUT
+          printf '%s' "$PAYLOAD_JSON" > /tmp/payload.json
+          python3 << 'PY'
           import json, os
-          p = json.load(open('/tmp/payload.json'))
+          try:
+            p = json.load(open('/tmp/payload.json'))
+          except Exception:
+            p = {}
           def g(*ks):
             for k in ks:
               v = p.get(k)
-              if v: return str(v)
+              if v is not None and str(v).strip():
+                return str(v).strip()
             return ''
-          print('zip_url=' + g('zipAssetUrl', 'zip_url', 'zipBrowserUrl', 'zipAssetApiUrl'))
-          print('api_url=' + g('zipAssetApiUrl', 'assetApiUrl'))
-          print('browser_url=' + g('zipBrowserUrl', 'browser_download_url'))
-          print('asset_id=' + g('assetId', 'asset_id') or os.environ.get('INPUT_ASSETID',''))
-          print('release_tag=' + g('zipReleaseTag', 'release_tag') or os.environ.get('INPUT_RELEASETAG',''))
-          print('repo=' + g('repo'))
-          print('app_name=' + (g('appName', 'app_name') or 'MyApp'))
+          asset = g('assetId', 'asset_id') or os.environ.get('INPUT_ASSETID', '') or '${{ inputs.assetId }}'
+          tag = g('zipReleaseTag', 'release_tag', 'releaseTag') or os.environ.get('INPUT_RELEASETAG', '') or '${{ inputs.releaseTag }}'
+          repo = g('repo') or os.environ.get('GITHUB_REPOSITORY', '')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f'asset_id={asset}\n')
+            f.write(f'release_tag={tag}\n')
+            f.write(f'repo={repo}\n')
+            f.write(f'app_name={g("appName", "app_name") or "MyApp"}\n')
+          print('asset_id=', asset)
+          print('release_tag=', tag)
+          print('repo=', repo)
           PY
-          echo "job_id=${{ inputs.jobId }}" >> $GITHUB_OUTPUT
-          if [ -n "${{ inputs.assetId }}" ]; then
-            echo "asset_id=${{ inputs.assetId }}" >> $GITHUB_OUTPUT
+
+      # UNDUH ZIP DULU (sebelum SDK) biar gagal cepat + jelas
+      - name: Download project ZIP from GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT_TOKEN: ${{ inputs.downloadToken }}
+          ASSET_ID: ${{ steps.meta.outputs.asset_id }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          REPO_NAME: ${{ steps.meta.outputs.repo }}
+        run: |
+          set -euo pipefail
+          mkdir -p project_src
+          REPO="${REPO_NAME:-$GITHUB_REPOSITORY}"
+          TAG="${RELEASE_TAG:-}"
+          AID="${ASSET_ID:-}"
+          # Token: PAT worker (yang upload) prioritas, fallback GITHUB_TOKEN
+          TOKEN="${PAT_TOKEN:-$GH_TOKEN}"
+          if [ -z "$TOKEN" ]; then TOKEN="$GH_TOKEN"; fi
+
+          echo "REPO=$REPO TAG=$TAG ASSET_ID=$AID token_len=${#TOKEN}"
+
+          download_asset() {
+            local id="$1"
+            local out="$2"
+            echo "GET releases/assets/$id"
+            HTTP=$(curl -sS -L --retry 3 --retry-delay 2 \
+              -o "$out" -w "%{http_code}" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${REPO}/releases/assets/${id}" || echo "000")
+            SZ=$(stat -c%s "$out" 2>/dev/null || echo 0)
+            echo "HTTP=$HTTP size=$SZ"
+            # deteksi HTML error
+            if head -c 20 "$out" 2>/dev/null | grep -qi '<!doctype\|<html\|{"message"'; then
+              echo "Response looks like error page/json"
+              head -c 300 "$out" || true
+              return 1
+            fi
+            [ "$SZ" -gt 10000 ]
+          }
+
+          OK=0
+
+          # 1) by asset id
+          if [ -n "$AID" ] && [ "$AID" != "" ]; then
+            if download_asset "$AID" project.zip; then OK=1; fi
           fi
-          if [ -n "${{ inputs.releaseTag }}" ]; then
-            echo "release_tag=${{ inputs.releaseTag }}" >> $GITHUB_OUTPUT
+
+          # 2) resolve id from tag
+          if [ "$OK" -eq 0 ] && [ -n "$TAG" ]; then
+            echo "Resolve asset from tag $TAG"
+            REL=$(curl -sS -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/releases/tags/${TAG}" || true)
+            echo "$REL" | head -c 400
+            AID2=$(python3 -c "import json,sys
+try:
+ d=json.load(sys.stdin)
+ print(next((str(a['id']) for a in d.get('assets',[]) if a.get('name')=='project.zip'),''))
+except Exception:
+ print('')
+" <<<"$REL")
+            echo "AID2=$AID2"
+            if [ -n "$AID2" ]; then
+              if download_asset "$AID2" project.zip; then OK=1; fi
+            fi
           fi
+
+          # 3) gh release download
+          if [ "$OK" -eq 0 ] && [ -n "$TAG" ]; then
+            echo "Try gh release download"
+            GH_TOKEN="$TOKEN" gh release download "$TAG" -R "$REPO" -p "project.zip" -D . && OK=1 || true
+            if [ -f project.zip ]; then
+              SZ=$(stat -c%s project.zip)
+              if [ "$SZ" -gt 10000 ]; then OK=1; else rm -f project.zip; OK=0; fi
+            fi
+          fi
+
+          if [ "$OK" -eq 0 ]; then
+            echo "FATAL download failed" | tee /tmp/download_error.txt
+            echo "REPO=$REPO TAG=$TAG AID=$AID" >> /tmp/download_error.txt
+            curl -sS -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/releases?per_page=3" | head -c 1500 | tee -a /tmp/download_error.txt || true
+            exit 1
+          fi
+
+          SZ=$(stat -c%s project.zip)
+          echo "ZIP OK size=$SZ"
+          unzip -q project.zip -d project_src
+          if [ "$(find project_src -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ] && \
+             [ "$(find project_src -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0 ]; then
+            ROOT=$(find project_src -mindepth 1 -maxdepth 1 -type d | head -1)
+            mv "$ROOT"/* project_src/ 2>/dev/null || true
+            mv "$ROOT"/.[!.]* project_src/ 2>/dev/null || true
+            rmdir "$ROOT" 2>/dev/null || true
+          fi
+          find project_src -maxdepth 3 -type f | head -40
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -104,96 +207,6 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
-
-      - name: Download project ZIP from GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ZIP_URL: ${{ steps.meta.outputs.zip_url }}
-          API_URL: ${{ steps.meta.outputs.api_url }}
-          BROWSER_URL: ${{ steps.meta.outputs.browser_url }}
-          ASSET_ID: ${{ steps.meta.outputs.asset_id }}
-          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
-          REPO: ${{ steps.meta.outputs.repo }}
-        run: |
-          set -euo pipefail
-          mkdir -p project_src
-          REPO_NAME="${REPO:-${{ github.repository }}}"
-          TAG="${RELEASE_TAG:-}"
-          echo "REPO=$REPO_NAME TAG=$TAG ASSET_ID=$ASSET_ID"
-          echo "ZIP_URL=$ZIP_URL"
-
-          # Method A: gh CLI (paling andal)
-          if [ -n "$TAG" ]; then
-            echo "=== Method A: gh release download ==="
-            if gh release download "$TAG" --repo "$REPO_NAME" --pattern "project.zip" --dir . 2>/tmp/gh_dl_err; then
-              if [ -f project.zip ] && [ "$(stat -c%s project.zip)" -gt 1000 ]; then
-                echo "OK via gh CLI size=$(stat -c%s project.zip)"
-              else
-                rm -f project.zip
-              fi
-            else
-              cat /tmp/gh_dl_err || true
-            fi
-          fi
-
-          # Method B: list release assets API then download by id
-          if [ ! -f project.zip ] || [ "$(stat -c%s project.zip 2>/dev/null || echo 0)" -le 1000 ]; then
-            echo "=== Method B: API list assets ==="
-            if [ -n "$TAG" ]; then
-              ASSETS_JSON=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO_NAME}/releases/tags/${TAG}" || true)
-              echo "$ASSETS_JSON" | head -c 500
-              AID=$(python3 -c "import json,sys; d=json.loads(sys.argv[1] or '{}'); print(next((a['id'] for a in d.get('assets',[]) if a.get('name')=='project.zip'),''))" "$ASSETS_JSON" 2>/dev/null || true)
-              if [ -z "$AID" ] && [ -n "$ASSET_ID" ]; then AID="$ASSET_ID"; fi
-              if [ -n "$AID" ]; then
-                echo "Downloading asset id=$AID"
-                curl -sS -L -o project.zip \
-                  -H "Authorization: Bearer $GH_TOKEN" \
-                  -H "Accept: application/octet-stream" \
-                  "https://api.github.com/repos/${REPO_NAME}/releases/assets/${AID}"
-                echo "size=$(stat -c%s project.zip 2>/dev/null || echo 0)"
-              fi
-            fi
-          fi
-
-          # Method C: direct URLs from payload
-          if [ ! -f project.zip ] || [ "$(stat -c%s project.zip 2>/dev/null || echo 0)" -le 1000 ]; then
-            echo "=== Method C: payload URLs ==="
-            for url in "$ZIP_URL" "$BROWSER_URL" "$API_URL"; do
-              [ -z "$url" ] && continue
-              echo "try $url"
-              HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
-                -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/octet-stream" \
-                "$url" || echo 000)
-              SZ=$(stat -c%s project.zip 2>/dev/null || echo 0)
-              echo "HTTP=$HTTP size=$SZ"
-              if [ "$SZ" -gt 1000 ]; then break; fi
-              rm -f project.zip
-            done
-          fi
-
-          SZ=$(stat -c%s project.zip 2>/dev/null || echo 0)
-          if [ "$SZ" -le 1000 ]; then
-            echo "FATAL: ZIP download failed (size=$SZ)"
-            ls -la
-            # debug releases
-            curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO_NAME}/releases?per_page=5" | head -c 800 || true
-            exit 1
-          fi
-
-          echo "ZIP OK size=$SZ"
-          unzip -q project.zip -d project_src
-          # flatten single root folder
-          if [ "$(find project_src -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ] && \
-             [ "$(find project_src -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0 ]; then
-            ROOT=$(find project_src -mindepth 1 -maxdepth 1 -type d | head -1)
-            mv "$ROOT"/* project_src/ 2>/dev/null || true
-            mv "$ROOT"/.[!.]* project_src/ 2>/dev/null || true
-            rmdir "$ROOT" 2>/dev/null || true
-          fi
-          find project_src -maxdepth 3 -type f | head -40
 
       - name: Locate Flutter project
         id: proj
