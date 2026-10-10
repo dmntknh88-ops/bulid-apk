@@ -15,6 +15,16 @@ on:
         description: 'JSON payload'
         required: true
         type: string
+      assetId:
+        description: 'Release asset ID (project.zip)'
+        required: false
+        default: ''
+        type: string
+      releaseTag:
+        description: 'Release tag name'
+        required: false
+        default: ''
+        type: string
 
 env:
   JAVA_VERSION: '17'
@@ -46,12 +56,17 @@ jobs:
           def g(*ks):
             for k in ks:
               v = p.get(k)
-              if v: return str(v)
+              if v is not None and str(v).strip() != '':
+                return str(v).strip()
             return ''
           print('zip_url=' + g('zipAssetUrl', 'zip_url', 'assetUrl'))
+          print('asset_id=' + g('assetId', 'asset_id'))
+          print('release_tag=' + g('zipReleaseTag', 'release_tag', 'tag'))
           print('app_name=' + (g('appName', 'app_name') or 'MyApp'))
           PY
           echo "job_id=${{ inputs.jobId }}" >> $GITHUB_OUTPUT
+          echo "input_asset_id=${{ inputs.assetId }}" >> $GITHUB_OUTPUT
+          echo "input_tag=${{ inputs.releaseTag }}" >> $GITHUB_OUTPUT
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -59,34 +74,28 @@ jobs:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
 
-      # Android SDK manual — lebih stabil daripada setup-android action yang sering gagal
       - name: Install Android SDK
         run: |
           set -euo pipefail
-          ANDROID_ROOT="${ANDROID_HOME:-$HOME/android-sdk}"
+          ANDROID_ROOT="${HOME}/android-sdk"
           mkdir -p "$ANDROID_ROOT/cmdline-tools"
           cd /tmp
           curl -fsSL -o cmdtools.zip \
             https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q cmdtools.zip -d "$ANDROID_ROOT/cmdline-tools"
-          # struktur yang diharapkan sdkmanager: cmdline-tools/latest
           rm -rf "$ANDROID_ROOT/cmdline-tools/latest"
           mv "$ANDROID_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_ROOT/cmdline-tools/latest"
-
           echo "ANDROID_HOME=$ANDROID_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_ROOT" >> "$GITHUB_ENV"
           echo "$ANDROID_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           echo "$ANDROID_ROOT/platform-tools" >> "$GITHUB_PATH"
-
           export ANDROID_HOME="$ANDROID_ROOT"
           export PATH="$ANDROID_ROOT/cmdline-tools/latest/bin:$PATH"
-
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-${{ env.ANDROID_API_LEVEL }}" \
             "build-tools;${{ env.ANDROID_BUILD_TOOLS }}"
-          sdkmanager --list_installed | head -30
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -96,33 +105,95 @@ jobs:
           cache: true
 
       - name: Flutter doctor
-        run: |
-          flutter config --no-analytics
-          flutter doctor -v || true
+        run: flutter config --no-analytics && (flutter doctor -v || true)
 
+      # ZIP diunduh dari Release repository worker (bukan VPS / Local API)
       - name: Download project ZIP from GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ZIP_URL: ${{ steps.meta.outputs.zip_url }}
+          ASSET_ID: ${{ steps.meta.outputs.input_asset_id || steps.meta.outputs.asset_id }}
+          RELEASE_TAG: ${{ steps.meta.outputs.input_tag || steps.meta.outputs.release_tag }}
+          JOB_ID: ${{ inputs.jobId }}
         run: |
           set -euo pipefail
           mkdir -p project_src
-          if [ -z "${ZIP_URL}" ]; then
-            echo "zipAssetUrl kosong"
-            cat /tmp/payload.json || true
+          TAG="${RELEASE_TAG:-build-${JOB_ID}}"
+          AID="${ASSET_ID:-}"
+
+          echo "repo=${{ github.repository }}"
+          echo "tag=$TAG asset_id=$AID"
+
+          download_ok=0
+
+          # 1) gh release download (paling stabil)
+          if command -v gh >/dev/null 2>&1; then
+            echo "Try: gh release download $TAG"
+            if gh release download "$TAG" -p "project.zip" -R "${{ github.repository }}" --clobber 2>/tmp/gh_dl_err; then
+              download_ok=1
+            else
+              cat /tmp/gh_dl_err || true
+              # coba pattern apa pun .zip
+              if gh release download "$TAG" -p "*.zip" -R "${{ github.repository }}" --clobber 2>/tmp/gh_dl_err2; then
+                mv -f *.zip project.zip 2>/dev/null || true
+                if [ -f project.zip ]; then download_ok=1; fi
+              fi
+              cat /tmp/gh_dl_err2 || true
+            fi
+          fi
+
+          # 2) API asset by ID
+          if [ "$download_ok" -ne 1 ] && [ -n "$AID" ]; then
+            echo "Try: releases/assets/$AID"
+            HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/assets/${AID}")
+            echo "asset HTTP=$HTTP size=$(stat -c%s project.zip 2>/dev/null || echo 0)"
+            if [ "$HTTP" = "200" ] && [ "$(stat -c%s project.zip)" -gt 1000 ]; then
+              download_ok=1
+            fi
+          fi
+
+          # 3) zipAssetUrl dari payload
+          if [ "$download_ok" -ne 1 ] && [ -n "${ZIP_URL}" ]; then
+            echo "Try: ZIP_URL"
+            HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              "${ZIP_URL}")
+            echo "url HTTP=$HTTP size=$(stat -c%s project.zip 2>/dev/null || echo 0)"
+            if [ "$(stat -c%s project.zip 2>/dev/null || echo 0)" -gt 1000 ]; then
+              download_ok=1
+            fi
+          fi
+
+          # 4) list release assets lalu unduh
+          if [ "$download_ok" -ne 1 ]; then
+            echo "Try: list release $TAG"
+            REL=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}" || true)
+            echo "$REL" | head -c 500
+            AID2=$(echo "$REL" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('assets',[{}])[0].get('id','') if d.get('assets') else '')" 2>/dev/null || true)
+            if [ -n "$AID2" ]; then
+              HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/octet-stream" \
+                "https://api.github.com/repos/${{ github.repository }}/releases/assets/${AID2}")
+              echo "list-asset HTTP=$HTTP"
+              if [ "$(stat -c%s project.zip 2>/dev/null || echo 0)" -gt 1000 ]; then
+                download_ok=1
+              fi
+            fi
+          fi
+
+          if [ "$download_ok" -ne 1 ]; then
+            echo "Gagal unduh project.zip dari Release repository"
+            ls -la || true
             exit 1
           fi
-          echo "Download ZIP: $ZIP_URL"
-          HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/octet-stream" \
-            "${ZIP_URL}")
-          SIZE=$(stat -c%s project.zip)
-          echo "HTTP=$HTTP size=$SIZE"
-          if [ "$SIZE" -lt 1000 ]; then
-            head -c 400 project.zip || true
-            exit 1
-          fi
+
           unzip -q project.zip -d project_src
           if [ "$(find project_src -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ] && \
              [ "$(find project_src -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0 ]; then
@@ -159,14 +230,8 @@ jobs:
           set -e
           flutter build apk --release
           APK=$(find build/app/outputs/flutter-apk -name '*.apk' -type f | head -1)
-          if [ -z "$APK" ]; then
-            APK=$(find build -name '*.apk' -type f | head -1)
-          fi
-          if [ -z "$APK" ]; then
-            echo "APK tidak ditemukan"
-            find build -type f | head -40
-            exit 1
-          fi
+          if [ -z "$APK" ]; then APK=$(find build -name '*.apk' -type f | head -1); fi
+          if [ -z "$APK" ]; then echo "APK tidak ditemukan"; find build -type f | head -40; exit 1; fi
           cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
           ls -lh "$GITHUB_WORKSPACE/app-release.apk"
 
