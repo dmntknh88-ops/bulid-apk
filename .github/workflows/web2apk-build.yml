@@ -4,27 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       jobId:
-        description: 'Job ID'
         required: true
         type: string
       userId:
-        description: 'User ID'
         required: true
         type: string
       payload:
-        description: 'JSON payload'
         required: true
         type: string
       assetId:
-        description: 'Release asset ID (project.zip)'
         required: false
-        default: ''
         type: string
+        default: ''
       releaseTag:
-        description: 'Release tag name'
         required: false
-        default: ''
         type: string
+        default: ''
 
 env:
   JAVA_VERSION: '17'
@@ -42,8 +37,7 @@ jobs:
       actions: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Parse payload
         id: meta
@@ -51,22 +45,28 @@ jobs:
           set -e
           echo '${{ inputs.payload }}' > /tmp/payload.json
           python3 - <<'PY' >> $GITHUB_OUTPUT
-          import json
+          import json, os
           p = json.load(open('/tmp/payload.json'))
           def g(*ks):
             for k in ks:
               v = p.get(k)
-              if v is not None and str(v).strip() != '':
-                return str(v).strip()
+              if v: return str(v)
             return ''
-          print('zip_url=' + g('zipAssetUrl', 'zip_url', 'assetUrl'))
-          print('asset_id=' + g('assetId', 'asset_id'))
-          print('release_tag=' + g('zipReleaseTag', 'release_tag', 'tag'))
+          print('zip_url=' + g('zipAssetUrl', 'zip_url', 'zipBrowserUrl', 'zipAssetApiUrl'))
+          print('api_url=' + g('zipAssetApiUrl', 'assetApiUrl'))
+          print('browser_url=' + g('zipBrowserUrl', 'browser_download_url'))
+          print('asset_id=' + g('assetId', 'asset_id') or os.environ.get('INPUT_ASSETID',''))
+          print('release_tag=' + g('zipReleaseTag', 'release_tag') or os.environ.get('INPUT_RELEASETAG',''))
+          print('repo=' + g('repo'))
           print('app_name=' + (g('appName', 'app_name') or 'MyApp'))
           PY
           echo "job_id=${{ inputs.jobId }}" >> $GITHUB_OUTPUT
-          echo "input_asset_id=${{ inputs.assetId }}" >> $GITHUB_OUTPUT
-          echo "input_tag=${{ inputs.releaseTag }}" >> $GITHUB_OUTPUT
+          if [ -n "${{ inputs.assetId }}" ]; then
+            echo "asset_id=${{ inputs.assetId }}" >> $GITHUB_OUTPUT
+          fi
+          if [ -n "${{ inputs.releaseTag }}" ]; then
+            echo "release_tag=${{ inputs.releaseTag }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -77,7 +77,7 @@ jobs:
       - name: Install Android SDK
         run: |
           set -euo pipefail
-          ANDROID_ROOT="${HOME}/android-sdk"
+          ANDROID_ROOT="$HOME/android-sdk"
           mkdir -p "$ANDROID_ROOT/cmdline-tools"
           cd /tmp
           curl -fsSL -o cmdtools.zip \
@@ -104,93 +104,68 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Flutter doctor
-        run: flutter config --no-analytics && (flutter doctor -v || true)
-
-      # ZIP diunduh dari Release repository worker (bukan VPS / Local API)
       - name: Download project ZIP from GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ZIP_URL: ${{ steps.meta.outputs.zip_url }}
-          ASSET_ID: ${{ steps.meta.outputs.input_asset_id || steps.meta.outputs.asset_id }}
-          RELEASE_TAG: ${{ steps.meta.outputs.input_tag || steps.meta.outputs.release_tag }}
-          JOB_ID: ${{ inputs.jobId }}
+          API_URL: ${{ steps.meta.outputs.api_url }}
+          BROWSER_URL: ${{ steps.meta.outputs.browser_url }}
+          ASSET_ID: ${{ steps.meta.outputs.asset_id }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          REPO: ${{ steps.meta.outputs.repo }}
         run: |
           set -euo pipefail
           mkdir -p project_src
-          TAG="${RELEASE_TAG:-build-${JOB_ID}}"
-          AID="${ASSET_ID:-}"
-
-          echo "repo=${{ github.repository }}"
-          echo "tag=$TAG asset_id=$AID"
+          REPO_NAME="${REPO:-${{ github.repository }}}"
 
           download_ok=0
-
-          # 1) gh release download (paling stabil)
-          if command -v gh >/dev/null 2>&1; then
-            echo "Try: gh release download $TAG"
-            if gh release download "$TAG" -p "project.zip" -R "${{ github.repository }}" --clobber 2>/tmp/gh_dl_err; then
-              download_ok=1
-            else
-              cat /tmp/gh_dl_err || true
-              # coba pattern apa pun .zip
-              if gh release download "$TAG" -p "*.zip" -R "${{ github.repository }}" --clobber 2>/tmp/gh_dl_err2; then
-                mv -f *.zip project.zip 2>/dev/null || true
-                if [ -f project.zip ]; then download_ok=1; fi
-              fi
-              cat /tmp/gh_dl_err2 || true
+          try_download() {
+            local url="$1"
+            local label="$2"
+            if [ -z "$url" ] || [ "$url" = "" ]; then
+              return 1
             fi
-          fi
-
-          # 2) API asset by ID
-          if [ "$download_ok" -ne 1 ] && [ -n "$AID" ]; then
-            echo "Try: releases/assets/$AID"
+            echo "Try ($label): $url"
             HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/octet-stream" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/assets/${AID}")
-            echo "asset HTTP=$HTTP size=$(stat -c%s project.zip 2>/dev/null || echo 0)"
-            if [ "$HTTP" = "200" ] && [ "$(stat -c%s project.zip)" -gt 1000 ]; then
+              "$url" || echo "000")
+            SIZE=$(stat -c%s project.zip 2>/dev/null || echo 0)
+            echo "  HTTP=$HTTP size=$SIZE"
+            if [ "$SIZE" -gt 1000 ]; then
               download_ok=1
+              return 0
             fi
+            return 1
+          }
+
+          # 1) release download by tag
+          if [ -n "${RELEASE_TAG}" ]; then
+            try_download "https://github.com/${REPO_NAME}/releases/download/${RELEASE_TAG}/project.zip" "tag-download" || true
+          fi
+          # 2) payload zip_url
+          if [ "$download_ok" -eq 0 ]; then
+            try_download "$ZIP_URL" "zip_url" || true
+          fi
+          # 3) browser url
+          if [ "$download_ok" -eq 0 ]; then
+            try_download "$BROWSER_URL" "browser" || true
+          fi
+          # 4) API asset by id
+          if [ "$download_ok" -eq 0 ] && [ -n "$ASSET_ID" ]; then
+            try_download "https://api.github.com/repos/${REPO_NAME}/releases/assets/${ASSET_ID}" "asset-id" || true
+          fi
+          # 5) api url
+          if [ "$download_ok" -eq 0 ]; then
+            try_download "$API_URL" "api_url" || true
           fi
 
-          # 3) zipAssetUrl dari payload
-          if [ "$download_ok" -ne 1 ] && [ -n "${ZIP_URL}" ]; then
-            echo "Try: ZIP_URL"
-            HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/octet-stream" \
-              "${ZIP_URL}")
-            echo "url HTTP=$HTTP size=$(stat -c%s project.zip 2>/dev/null || echo 0)"
-            if [ "$(stat -c%s project.zip 2>/dev/null || echo 0)" -gt 1000 ]; then
-              download_ok=1
-            fi
-          fi
-
-          # 4) list release assets lalu unduh
-          if [ "$download_ok" -ne 1 ]; then
-            echo "Try: list release $TAG"
-            REL=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}" || true)
-            echo "$REL" | head -c 500
-            AID2=$(echo "$REL" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('assets',[{}])[0].get('id','') if d.get('assets') else '')" 2>/dev/null || true)
-            if [ -n "$AID2" ]; then
-              HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
-                -H "Authorization: Bearer ${GH_TOKEN}" \
-                -H "Accept: application/octet-stream" \
-                "https://api.github.com/repos/${{ github.repository }}/releases/assets/${AID2}")
-              echo "list-asset HTTP=$HTTP"
-              if [ "$(stat -c%s project.zip 2>/dev/null || echo 0)" -gt 1000 ]; then
-                download_ok=1
-              fi
-            fi
-          fi
-
-          if [ "$download_ok" -ne 1 ]; then
-            echo "Gagal unduh project.zip dari Release repository"
-            ls -la || true
+          if [ "$download_ok" -eq 0 ]; then
+            echo "Semua sumber unduh ZIP gagal"
+            echo "ZIP_URL=$ZIP_URL"
+            echo "ASSET_ID=$ASSET_ID TAG=$RELEASE_TAG REPO=$REPO_NAME"
+            ls -la project.zip 2>/dev/null || true
+            head -c 300 project.zip 2>/dev/null || true
             exit 1
           fi
 
@@ -230,13 +205,18 @@ jobs:
           set -e
           flutter build apk --release
           APK=$(find build/app/outputs/flutter-apk -name '*.apk' -type f | head -1)
-          if [ -z "$APK" ]; then APK=$(find build -name '*.apk' -type f | head -1); fi
-          if [ -z "$APK" ]; then echo "APK tidak ditemukan"; find build -type f | head -40; exit 1; fi
+          if [ -z "$APK" ]; then
+            APK=$(find build -name '*.apk' -type f | head -1)
+          fi
+          if [ -z "$APK" ]; then
+            echo "APK tidak ditemukan"
+            find build -type f | head -40
+            exit 1
+          fi
           cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
           ls -lh "$GITHUB_WORKSPACE/app-release.apk"
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: apk-${{ inputs.jobId }}
           path: app-release.apk
