@@ -35,6 +35,7 @@ jobs:
     permissions:
       contents: read
       actions: write
+      checks: read
 
     steps:
       - uses: actions/checkout@v4
@@ -117,59 +118,74 @@ jobs:
           set -euo pipefail
           mkdir -p project_src
           REPO_NAME="${REPO:-${{ github.repository }}}"
+          TAG="${RELEASE_TAG:-}"
+          echo "REPO=$REPO_NAME TAG=$TAG ASSET_ID=$ASSET_ID"
+          echo "ZIP_URL=$ZIP_URL"
 
-          download_ok=0
-          try_download() {
-            local url="$1"
-            local label="$2"
-            if [ -z "$url" ] || [ "$url" = "" ]; then
-              return 1
+          # Method A: gh CLI (paling andal)
+          if [ -n "$TAG" ]; then
+            echo "=== Method A: gh release download ==="
+            if gh release download "$TAG" --repo "$REPO_NAME" --pattern "project.zip" --dir . 2>/tmp/gh_dl_err; then
+              if [ -f project.zip ] && [ "$(stat -c%s project.zip)" -gt 1000 ]; then
+                echo "OK via gh CLI size=$(stat -c%s project.zip)"
+              else
+                rm -f project.zip
+              fi
+            else
+              cat /tmp/gh_dl_err || true
             fi
-            echo "Try ($label): $url"
-            HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/octet-stream" \
-              "$url" || echo "000")
-            SIZE=$(stat -c%s project.zip 2>/dev/null || echo 0)
-            echo "  HTTP=$HTTP size=$SIZE"
-            if [ "$SIZE" -gt 1000 ]; then
-              download_ok=1
-              return 0
+          fi
+
+          # Method B: list release assets API then download by id
+          if [ ! -f project.zip ] || [ "$(stat -c%s project.zip 2>/dev/null || echo 0)" -le 1000 ]; then
+            echo "=== Method B: API list assets ==="
+            if [ -n "$TAG" ]; then
+              ASSETS_JSON=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO_NAME}/releases/tags/${TAG}" || true)
+              echo "$ASSETS_JSON" | head -c 500
+              AID=$(python3 -c "import json,sys; d=json.loads(sys.argv[1] or '{}'); print(next((a['id'] for a in d.get('assets',[]) if a.get('name')=='project.zip'),''))" "$ASSETS_JSON" 2>/dev/null || true)
+              if [ -z "$AID" ] && [ -n "$ASSET_ID" ]; then AID="$ASSET_ID"; fi
+              if [ -n "$AID" ]; then
+                echo "Downloading asset id=$AID"
+                curl -sS -L -o project.zip \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/octet-stream" \
+                  "https://api.github.com/repos/${REPO_NAME}/releases/assets/${AID}"
+                echo "size=$(stat -c%s project.zip 2>/dev/null || echo 0)"
+              fi
             fi
-            return 1
-          }
-
-          # 1) release download by tag
-          if [ -n "${RELEASE_TAG}" ]; then
-            try_download "https://github.com/${REPO_NAME}/releases/download/${RELEASE_TAG}/project.zip" "tag-download" || true
-          fi
-          # 2) payload zip_url
-          if [ "$download_ok" -eq 0 ]; then
-            try_download "$ZIP_URL" "zip_url" || true
-          fi
-          # 3) browser url
-          if [ "$download_ok" -eq 0 ]; then
-            try_download "$BROWSER_URL" "browser" || true
-          fi
-          # 4) API asset by id
-          if [ "$download_ok" -eq 0 ] && [ -n "$ASSET_ID" ]; then
-            try_download "https://api.github.com/repos/${REPO_NAME}/releases/assets/${ASSET_ID}" "asset-id" || true
-          fi
-          # 5) api url
-          if [ "$download_ok" -eq 0 ]; then
-            try_download "$API_URL" "api_url" || true
           fi
 
-          if [ "$download_ok" -eq 0 ]; then
-            echo "Semua sumber unduh ZIP gagal"
-            echo "ZIP_URL=$ZIP_URL"
-            echo "ASSET_ID=$ASSET_ID TAG=$RELEASE_TAG REPO=$REPO_NAME"
-            ls -la project.zip 2>/dev/null || true
-            head -c 300 project.zip 2>/dev/null || true
+          # Method C: direct URLs from payload
+          if [ ! -f project.zip ] || [ "$(stat -c%s project.zip 2>/dev/null || echo 0)" -le 1000 ]; then
+            echo "=== Method C: payload URLs ==="
+            for url in "$ZIP_URL" "$BROWSER_URL" "$API_URL"; do
+              [ -z "$url" ] && continue
+              echo "try $url"
+              HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/octet-stream" \
+                "$url" || echo 000)
+              SZ=$(stat -c%s project.zip 2>/dev/null || echo 0)
+              echo "HTTP=$HTTP size=$SZ"
+              if [ "$SZ" -gt 1000 ]; then break; fi
+              rm -f project.zip
+            done
+          fi
+
+          SZ=$(stat -c%s project.zip 2>/dev/null || echo 0)
+          if [ "$SZ" -le 1000 ]; then
+            echo "FATAL: ZIP download failed (size=$SZ)"
+            ls -la
+            # debug releases
+            curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO_NAME}/releases?per_page=5" | head -c 800 || true
             exit 1
           fi
 
+          echo "ZIP OK size=$SZ"
           unzip -q project.zip -d project_src
+          # flatten single root folder
           if [ "$(find project_src -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ] && \
              [ "$(find project_src -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0 ]; then
             ROOT=$(find project_src -mindepth 1 -maxdepth 1 -type d | head -1)
